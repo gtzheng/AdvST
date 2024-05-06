@@ -1,6 +1,6 @@
 import argparse
 import os
-from model_domainnet import ModelADASemantics, ModelADA, ModelBaseline
+from model_domainnet import ModelADASemantics, ModelADASemanticsDisk, ModelADA, ModelBaseline
 from common.utils import time_str, Timer, set_gpu
 from test_models import main as eval_models
 
@@ -20,7 +20,10 @@ def main(args):
     elif args.algorithm == "ADA":
         model_obj = ModelADA(flags=args)
     elif args.algorithm == "AdvST":
-        model_obj = ModelADASemantics(flags=args)
+        if len(args.aug_folder) == 0:
+            model_obj = ModelADASemantics(flags=args)
+        else:
+            model_obj = ModelADASemanticsDisk(flags=args)
     else:
         raise RuntimeError
     timer = Timer()
@@ -82,7 +85,7 @@ if __name__ == "__main__":
         "--imbalanced_class", type=bool, default=True, help=""
     )
     train_arg_parser.add_argument("--imbalance_ratio", type=float, default=2.0, help="")
-    train_arg_parser.add_argument("--store_data", type=bool, default=False, help="")
+    train_arg_parser.add_argument("--aug_folder", type=str, default='', help="if specified, all augmented data is stored on disk instead of in memory")
     train_arg_parser.add_argument("--k", type=int, default=10, help="")
     train_arg_parser.add_argument("--gamma", type=float, default=10.0, help="")
     train_arg_parser.add_argument("--train_mode", type=str, default="normal", help="")

@@ -995,3 +995,291 @@ class ModelADASemantics(ModelBaseline):
                     train_dataset, True, flags.k * flags.loops_min * flags.batch_size
                 ),
             )
+
+
+class ModelADASemanticsDisk(ModelBaseline):
+    def __init__(self, flags):
+        super(ModelADASemanticsDisk, self).__init__(flags)
+
+    def save_model(self, file_name, flags):
+        outfile = os.path.join(flags.model_path, file_name)
+
+        aug_probs = [
+            (
+                "-".join(
+                    [
+                        self.semantic_config.semantic_aug_list[o][0].__name__
+                        for o in self.semantic_config.ops[i]
+                    ]
+                ),
+                self.semantic_config.probs[i],
+            )
+            for i in range(len(self.semantic_config.ops))
+        ]
+        torch.save(
+            {"state": self.network.state_dict(), "args": flags, "aug_probs": aug_probs},
+            outfile,
+        )
+
+    def load_model(self, flags):
+        print("Load model from ", flags.chkpt_path)
+        model_dict = torch.load(flags.chkpt_path)
+        prob_tuples = model_dict["aug_probs"]
+        self.semantic_config.probs = np.array([t[1] for t in prob_tuples])
+        self.network.load_state_dict(model_dict["state"])
+
+    def configure(self, flags):
+        super(ModelADASemanticsDisk, self).configure(flags)
+        self.dist_fn = torch.nn.MSELoss()
+        self.conloss = SupConLoss()
+        self.mean = torch.tensor([0.485, 0.456, 0.406])
+        self.std = torch.tensor([0.229, 0.224, 0.225])
+        self.image_transform = transforms.ToPILImage()
+        self.image_denormalise = Denormalise(
+            [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+        )
+        self.scheduler = lr_scheduler.CosineAnnealingLR(
+            self.optimizer, flags.train_epochs * flags.loops_min
+        )
+        self.semantic_config = SemanticPerturbation()
+
+        if getattr(flags, "loo", None) is None:
+            sel_index = None
+        else:
+            num_ops = len(SemanticPerturbation.semantics_list)
+            sel_index = np.array([i for i in range(num_ops) if i != flags.loo])
+        self.semantic_config = SemanticPerturbation(sel_index=sel_index)
+        self.aug_count = 0
+        if not os.path.exists(flags.aug_folder):
+            os.makedirs(flags.aug_folder)
+    def maximize(self, flags, epoch):
+        self.aug_count = (self.aug_count + 1) % self.pool_size
+        self.network.eval()
+        images, labels, op_labels = [], [], []
+        self.train_dataset.transform = self.train_dataset.preprocess
+        train_loader = DataLoader(
+            self.train_dataset,
+            batch_size=128,
+            num_workers=12,
+            shuffle=False,
+            sampler=RandomSampler(self.train_dataset, True, flags.loops_min * 128),
+        )
+        mean = self.mean.cuda()
+        std = self.std.cuda()
+        with tqdm(train_loader, leave=False, total=len(train_loader)) as pbar:
+            for ite, (images_train, labels_train, _) in enumerate(pbar):
+                inputs, targets = images_train.cuda(), labels_train.cuda()
+                out, tuples = self.network(x=inputs)
+                inputs_embedding = tuples["Embedding"].data.clone()
+                inputs_embedding.requires_grad_(False)
+
+                batch_size = len(inputs)
+                semantic_perturb = self.semantic_config.sample(batch_size).to(
+                    inputs.device
+                )
+                op_labels.append(np.array([semantic_perturb.op_label] * batch_size))
+
+                diff_loss = 1.0
+                prev_loss = 1000
+                iter_count = 0
+
+                optimizer = torch.optim.RMSprop(
+                    semantic_perturb.parameters(), flags.lr_max
+                )
+                ori_inputs = (
+                    inputs * std.view(1, 3, 1, 1) + mean.view(1, 3, 1, 1)
+                ).data
+
+                while diff_loss > 0.1 and iter_count < flags.loops_adv:
+                    inputs_max = semantic_perturb(ori_inputs.data)
+                    inputs_max = (inputs_max - mean.view(1, 3, 1, 1)) / std.view(
+                        1, 3, 1, 1
+                    )
+
+                    out, tuples = self.network(x=inputs_max)
+                    cls_loss = self.loss_fn(out, targets)
+                    semantic_loss = self.dist_fn(tuples["Embedding"], inputs_embedding)
+                    ent_loss = entropy_loss(out)
+                    loss = cls_loss - flags.gamma * semantic_loss + flags.eta * ent_loss
+
+                    optimizer.zero_grad()
+                    (-loss).backward()
+
+                    optimizer.step()
+
+                    diff_loss = abs((loss - prev_loss).item())
+                    prev_loss = loss.item()
+                    iter_count += 1
+
+                    pbar.set_postfix(
+                        {
+                            "loss": "{:.4f}".format(loss.item()),
+                            "dist": "{:.6f}".format(semantic_loss.item()),
+                        }
+                    )
+
+                inputs_max = semantic_perturb(ori_inputs.data)
+                inputs_max = (inputs_max - mean.view(1, 3, 1, 1)) / std.view(1, 3, 1, 1)
+                for n in range(len(inputs_max)):
+                    name = os.path.join(flags.aug_folder, f"aug_{self.aug_count}_{ite}_{n}.pt")
+                    img_data = inputs_max[n].detach().clone().cpu()
+                    target = targets[n].cpu()
+                    torch.save((img_data, target, torch.tensor(semantic_perturb.op_label)), name)
+                    
+                    images.append(name)
+                    labels.append(target.item())
+        labels = torch.tensor(labels)
+
+        op_labels = torch.tensor(np.concatenate(op_labels))
+        return images, labels, op_labels
+
+    def train(self, flags):
+        counter_k = 0
+        best_val_acc = 0
+        best_test_acc = 0
+        flags_log = os.path.join(flags.logs, "loss_log.txt")
+        if not os.path.exists(flags.model_path):
+            os.makedirs(flags.model_path)
+        train_dataset = deepcopy(self.train_dataset)
+        data_pool = DataPool(flags.k + 1)
+        self.pool_size = data_pool.pool_size
+        ori_data = []
+        ori_label = []
+        ori_op_label = []
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=flags.batch_size,
+            num_workers=flags.num_workers,
+            shuffle=False,
+            sampler=RandomSampler(
+                train_dataset, True, flags.loops_min * flags.batch_size
+            ),
+        )
+        for ite, (images_train, labels_train, op_labels) in tqdm(
+            enumerate(train_loader, start=1), total=len(train_loader), leave=False
+        ):
+            
+            for n in range(len(images_train)):
+                name = os.path.join(flags.aug_folder, f"aug_{self.aug_count}_{ite}_{n}.pt")
+                data = images_train[n]
+                target = labels_train[n]
+                torch.save((data, target, torch.tensor(-2)), name)
+                
+                ori_data.append(name)
+                ori_op_label.append(-2)
+            ori_label.append(labels_train)
+       
+        ori_label = torch.cat(ori_label, dim=0)
+        ori_op_label = torch.tensor(ori_op_label)
+        data_pool.add((ori_data, ori_label, ori_op_label))
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=flags.batch_size,
+            num_workers=flags.num_workers,
+            shuffle=False,
+            sampler=RandomSampler(
+                train_dataset, True, flags.loops_min * flags.batch_size * flags.k
+            ),
+        )
+
+        counter_ite = 0
+        for epoch in range(1, flags.train_epochs + 1):
+            loss_avger = Averager()
+            cls_loss_avger = Averager()
+            con_loss_avger = Averager()
+            entloss_avger = Averager()
+
+            for ite, (images_train, labels_train, op_labels) in tqdm(
+                enumerate(train_loader, start=1),
+                total=len(train_loader),
+                leave=False,
+                desc="train-epoch{}".format(epoch),
+            ):
+                self.network.train()
+                counter_ite += 1
+                inputs, labels = images_train.cuda(), labels_train.cuda()
+                img_shape = inputs.shape[-3:]
+                outputs, tuples = self.network(x=inputs.reshape(-1, *img_shape))
+                cls_loss_ele = self.loss_per_ele(outputs, labels.reshape(-1))
+                cls_loss = cls_loss_ele.mean()
+
+                cls_loss_avger.add(cls_loss.item())
+                ent_loss = entropy_loss(outputs)
+                entloss_avger.add(ent_loss.item())
+                if flags.train_mode == "contrastive":
+                    projs = tuples["Projection"]
+                    projs = projs.reshape(inputs.shape[0], -1, projs.shape[-1])
+
+                    con_loss = self.conloss(projs, labels)
+
+                    loss = cls_loss + flags.beta * con_loss - flags.eta_min * ent_loss
+                    con_loss_avger.add(con_loss.item())
+                else:
+                    loss = cls_loss - flags.eta_min * ent_loss
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                loss_avger.add(loss.item())
+
+                self.scheduler.step()
+
+            val_acc = self.batch_test(self.val_loader)
+            acc_arr = self.batch_test_workflow()
+            mean_acc = np.array(acc_arr).mean()
+            names = [n for n, _ in self.test_loaders]
+            res = (
+                "\n{} ".format(self.train_name)
+                + " ".join(["{}:{:.6f}".format(n, a) for n, a in zip(names, acc_arr)])
+                + " Mean:{:.6f}".format(mean_acc)
+            )
+            msg = "[{}] train_loss:{:.4f} cls:{:.4f} con:{:.4f} ent {:.4f} lr:{:.4f} val_acc:{:.4f}".format(
+                epoch,
+                loss_avger.item(),
+                cls_loss_avger.item(),
+                con_loss_avger.item(),
+                entloss_avger.item(),
+                self.scheduler.get_last_lr()[0],
+                val_acc,
+            )
+
+            if best_test_acc < mean_acc:
+                best_test_acc = mean_acc
+                self.save_model("best_test_model.tar", flags)
+            if best_val_acc < val_acc:
+                best_val_acc = val_acc
+                msg += " (best)"
+                self.save_model("best_model.tar", flags)
+
+            msg += res
+            print(msg)
+            write_log(msg, flags_log)
+            # self.save_model('latest_model.tar', flags)
+            if (
+                epoch % flags.gen_freq == 0
+                and epoch < flags.train_epochs
+                and counter_k < flags.domain_number
+            ):  # if T_min iterations are passed
+                print("Semantic image generation [iter {}]".format(counter_k))
+                images, labels, op_labels = self.maximize(flags, epoch)
+                data_pool.add((images, labels, op_labels))
+
+                counter_k += 1
+            data_batch = data_pool.get()
+
+            gen_x = [name for p in data_batch for name in p[0]]
+            gen_y = torch.cat([p[1] for p in data_batch], 0)
+            gen_op_labels = torch.cat([p[2] for p in data_batch], 0)
+
+            train_dataset.x = gen_x
+            train_dataset.y = gen_y
+            train_dataset.op_labels = gen_op_labels
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=flags.batch_size,
+                num_workers=flags.num_workers,
+                shuffle=False,
+                sampler=RandomSampler(
+                    train_dataset, True, flags.k * flags.loops_min * flags.batch_size
+                ),
+            )

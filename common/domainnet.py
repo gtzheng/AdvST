@@ -190,9 +190,12 @@ class DomainNetFull(Dataset):
         x = self.x[index]
         y = self.y[index]
         op = self.op_labels[index]
-    
+
         if op == -1:
             with Image.open(x) as image:
                 image = image.convert('RGB')
                 x = self.transform(image)
+        else:
+            if type(x) == str:
+                x, y, op = torch.load(x)
         return x, y, op
